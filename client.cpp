@@ -47,6 +47,7 @@
 #include <atomic>
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
 #include <chrono>
 #include <algorithm>
 
@@ -83,6 +84,12 @@ static const GUID NV_ENC_PRESET_COMPAT_DEFAULT_GUID =
 
 static const char* VIDEO_VIEW_PORT = "8080";
 static const char* VIDEO_BROADCAST_PORT = "8082";
+static const char* CHAT_PORT = "8081";
+
+static const uint8_t CHAT_MSG_LOGIN      = 0x00;
+static const uint8_t CHAT_MSG_TEXT       = 0x01;
+static const uint8_t CHAT_MSG_AUDIO_PCM  = 0x02;
+static const uint8_t CHAT_MSG_AUDIO_OPUS = 0x03;
 
 static const int MAX_FRAME_SIZE = 4 * 1024 * 1024;
 static const int FRAME_QUEUE_SIZE = 6;
@@ -138,6 +145,48 @@ static bool SendAll(SOCKET sock, const void* buf, int len)
     }
 
     return true;
+}
+
+static bool SendChatFrame(SOCKET sock, const std::vector<uint8_t>& data)
+{
+    uint32_t len = static_cast<uint32_t>(data.size());
+
+    if (!SendAll(sock, &len, 4))
+        return false;
+
+    if (!SendAll(sock, data.data(), static_cast<int>(data.size())))
+        return false;
+
+    return true;
+}
+
+static bool RecvChatFrame(SOCKET sock, std::vector<uint8_t>& out)
+{
+    uint32_t len = 0;
+
+    if (!RecvAll(sock, &len, 4))
+        return false;
+
+    // Для текста и аудио этого более чем достаточно
+    static const uint32_t MAX_CLIENT_CHAT_FRAME_SIZE = 256 * 1024;
+
+    if (len == 0 || len > MAX_CLIENT_CHAT_FRAME_SIZE)
+        return false;
+
+    out.resize(len);
+
+    if (!RecvAll(sock, out.data(), static_cast<int>(len)))
+        return false;
+
+    return true;
+}
+
+static void AppendU32LE(std::vector<uint8_t>& v, uint32_t x)
+{
+    v.push_back(static_cast<uint8_t>((x >> 0) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 24) & 0xFF));
 }
 
 static bool ConnectTCP(const std::string& ip, const std::string& port, SOCKET& outSock)
@@ -1253,6 +1302,248 @@ private:
     std::atomic<bool> m_Running{ true };
 };
 
+enum class EncoderKind
+{
+    NVENC = 0,
+    CPU   = 1
+};
+
+class SoftwareH264Encoder
+{
+public:
+    ~SoftwareH264Encoder()
+    {
+        Clean();
+    }
+
+    bool Init(uint32_t width, uint32_t height, uint32_t bitrate, uint32_t fps)
+    {
+        Clean();
+
+        const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
+        if (!codec)
+            codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+
+        if (!codec)
+        {
+            Log("[CpuEnc] H.264 CPU encoder not found");
+            return false;
+        }
+
+        m_Ctx = avcodec_alloc_context3(codec);
+        if (!m_Ctx)
+            return false;
+
+        int f = std::max(1, static_cast<int>(fps));
+
+        m_Width = width;
+        m_Height = height;
+
+        m_Ctx->width = static_cast<int>(width);
+        m_Ctx->height = static_cast<int>(height);
+        m_Ctx->time_base = AVRational{1, f};
+        m_Ctx->framerate = AVRational{f, 1};
+        m_Ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+        m_Ctx->bit_rate = static_cast<int64_t>(bitrate);
+        m_Ctx->rc_max_rate = static_cast<int64_t>(bitrate);
+        m_Ctx->rc_buffer_size = static_cast<int>(bitrate / 5);
+
+        m_Ctx->gop_size = f * 2;
+        m_Ctx->max_b_frames = 0;
+
+        m_Ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        m_Ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+
+        int threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (threads <= 0)
+            threads = 4;
+        else
+            threads /= 2;
+
+        if (threads < 2)
+            threads = 2;
+
+        m_Ctx->thread_count = threads;
+        m_Ctx->thread_type = FF_THREAD_SLICE;
+
+        // Для скринкаста часто лучше выглядит full range.
+        // Если цвета становятся блеклыми/слишком контрастными, можно убрать.
+        m_Ctx->color_range = AVCOL_RANGE_JPEG;
+
+        // Максимально low-latency пресеты.
+        av_opt_set(m_Ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(m_Ctx->priv_data, "tune", "zerolatency", 0);
+        av_opt_set(m_Ctx->priv_data, "profile", "baseline", 0);
+
+        std::string xparams =
+            "rc-lookahead=0:"
+            "sync-lookahead=0:"
+            "bframes=0:"
+            "scenecut=0:"
+            "repeat-headers=1:"
+            "keyint=" + std::to_string(f * 2);
+
+        av_opt_set(m_Ctx->priv_data, "x264-params", xparams.c_str(), 0);
+
+        if (avcodec_open2(m_Ctx, codec, nullptr) < 0)
+        {
+            Log("[CpuEnc] avcodec_open2 failed");
+            Clean();
+            return false;
+        }
+
+        m_Frame = av_frame_alloc();
+        if (!m_Frame)
+        {
+            Clean();
+            return false;
+        }
+
+        m_Frame->format = m_Ctx->pix_fmt;
+        m_Frame->width = m_Ctx->width;
+        m_Frame->height = m_Ctx->height;
+
+        if (av_frame_get_buffer(m_Frame, 32) < 0)
+        {
+            Log("[CpuEnc] av_frame_get_buffer failed");
+            Clean();
+            return false;
+        }
+
+        m_Pkt = av_packet_alloc();
+        if (!m_Pkt)
+        {
+            Clean();
+            return false;
+        }
+
+        m_Pts = 0;
+
+        Log("[CpuEnc] CPU H.264 encoder initialized: " +
+            std::to_string(width) + "x" + std::to_string(height) +
+            ", bitrate=" + std::to_string(bitrate / 1000) + " kbps" +
+            ", fps=" + std::to_string(f));
+
+        return true;
+    }
+
+    bool EncodeBGRA(
+        const uint8_t* bgra,
+        int pitch,
+        uint32_t width,
+        uint32_t height,
+        bool forceIDR,
+        std::vector<uint8_t>& out,
+        bool& isKey)
+    {
+        if (!m_Ctx || !bgra)
+            return false;
+
+        if (width != m_Width || height != m_Height)
+            return false;
+
+        if (!m_Sws)
+        {
+            m_Sws = sws_getContext(
+                static_cast<int>(width),
+                static_cast<int>(height),
+                AV_PIX_FMT_BGRA,
+                static_cast<int>(width),
+                static_cast<int>(height),
+                AV_PIX_FMT_YUV420P,
+                SWS_BILINEAR,
+                nullptr,
+                nullptr,
+                nullptr
+            );
+
+            if (!m_Sws)
+            {
+                Log("[CpuEnc] sws_getContext failed");
+                return false;
+            }
+        }
+
+        if (av_frame_make_writable(m_Frame) < 0)
+            return false;
+
+        const uint8_t* src[4] = { bgra, nullptr, nullptr, nullptr };
+        int srcStride[4] = { pitch, 0, 0, 0 };
+
+        sws_scale(
+            m_Sws,
+            src,
+            srcStride,
+            0,
+            static_cast<int>(height),
+            m_Frame->data,
+            m_Frame->linesize
+        );
+
+        m_Frame->pts = m_Pts++;
+        m_Frame->flags = (m_Frame->flags & ~AV_FRAME_FLAG_KEY) |
+                         (forceIDR ? AV_FRAME_FLAG_KEY : 0);
+        m_Frame->pict_type = forceIDR ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+
+        int ret = avcodec_send_frame(m_Ctx, m_Frame);
+        if (ret < 0)
+            return false;
+
+        ret = avcodec_receive_packet(m_Ctx, m_Pkt);
+        if (ret < 0)
+            return false;
+
+        out.assign(m_Pkt->data, m_Pkt->data + m_Pkt->size);
+        isKey = (m_Pkt->flags & AV_PKT_FLAG_KEY) != 0;
+
+        av_packet_unref(m_Pkt);
+
+        return true;
+    }
+
+    void Clean()
+    {
+        if (m_Sws)
+        {
+            sws_freeContext(m_Sws);
+            m_Sws = nullptr;
+        }
+
+        if (m_Pkt)
+        {
+            av_packet_free(&m_Pkt);
+            m_Pkt = nullptr;
+        }
+
+        if (m_Frame)
+        {
+            av_frame_free(&m_Frame);
+            m_Frame = nullptr;
+        }
+
+        if (m_Ctx)
+        {
+            avcodec_free_context(&m_Ctx);
+            m_Ctx = nullptr;
+        }
+
+        m_Width = 0;
+        m_Height = 0;
+        m_Pts = 0;
+    }
+
+private:
+    AVCodecContext* m_Ctx = nullptr;
+    AVFrame* m_Frame = nullptr;
+    AVPacket* m_Pkt = nullptr;
+    SwsContext* m_Sws = nullptr;
+
+    uint32_t m_Width = 0;
+    uint32_t m_Height = 0;
+    int64_t m_Pts = 0;
+};
+
 class ScreenBroadcaster
 {
 public:
@@ -1262,6 +1553,8 @@ public:
         int height = 1080;
         int fps = 60;
         int bitrateKbps = 8000;
+
+        EncoderKind encoder = EncoderKind::NVENC;
     };
 
     std::atomic<bool> running{ false };
@@ -1288,6 +1581,8 @@ public:
             return;
 
         m_Config = config;
+        m_EncoderKind = config.encoder;
+
         m_TargetWidth  = (config.width + 1) & ~1;
         m_TargetHeight = (config.height + 1) & ~1;
         m_Fps     = config.fps;
@@ -1300,16 +1595,23 @@ public:
 
         m_SendQueue.Start();
 
+        if (m_EncoderKind == EncoderKind::CPU)
+        {
+            m_CpuEncodeThread = std::thread(&ScreenBroadcaster::CpuEncodeLoop, this);
+        }
+
         m_SendThread   = std::thread(&ScreenBroadcaster::SendLoop, this);
         m_Thread       = std::thread(&ScreenBroadcaster::BroadcastLoop, this);
 
-        Log("[Broadcast] Started");
+        Log(std::string("[Broadcast] Started, encoder=") +
+            (m_EncoderKind == EncoderKind::NVENC ? "NVENC" : "CPU"));
     }
 
     void Stop()
     {
         running = false;
         m_SendQueue.Stop();
+        m_CpuCV.notify_all();
 
         if (m_Sock != INVALID_SOCKET)
         {
@@ -1318,10 +1620,20 @@ public:
             m_Sock = INVALID_SOCKET;
         }
 
-        if (m_Thread.joinable())     m_Thread.join();
-        if (m_SendThread.joinable()) m_SendThread.join();
+        if (m_Thread.joinable())          m_Thread.join();
+        if (m_CpuEncodeThread.joinable()) m_CpuEncodeThread.join();
+        if (m_SendThread.joinable())      m_SendThread.join();
 
         connected = false;
+
+        {
+            std::lock_guard<std::mutex> lock(m_CpuMutex);
+            while (!m_CpuQueue.empty())
+                m_CpuQueue.pop();
+        }
+
+        m_CpuEncoder.Clean();
+
         CleanupDX();
 
         capturedFps = 0; encodedFps = 0; sentFps = 0; sentKbps = 0;
@@ -1423,35 +1735,62 @@ private:
         if (!CreateDuplication())
             return false;
 
-        if (!m_Encoder.Init(m_Device, m_TargetWidth, m_TargetHeight, m_Bitrate))
+        if (m_EncoderKind == EncoderKind::NVENC)
         {
-            Log("[Broadcast] NVENC init failed");
-            return false;
-        }
-
-        m_EncodeSurfaces.resize(HWEncoder::NUM_SURFACES, nullptr);
-
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = m_TargetWidth;
-        desc.Height = m_TargetHeight;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-        for (int i = 0; i < HWEncoder::NUM_SURFACES; ++i)
-        {
-            if (FAILED(m_Device->CreateTexture2D(&desc, nullptr, &m_EncodeSurfaces[i])))
+            if (!m_Encoder.Init(m_Device, m_TargetWidth, m_TargetHeight, m_Bitrate))
             {
-                Log("[Broadcast] CreateTexture2D failed");
+                Log("[Broadcast] NVENC init failed");
                 return false;
             }
 
-            if (!m_Encoder.RegisterSurface(i, m_EncodeSurfaces[i]))
+            m_EncodeSurfaces.resize(HWEncoder::NUM_SURFACES, nullptr);
+
+            D3D11_TEXTURE2D_DESC desc = {};
+            desc.Width = m_TargetWidth;
+            desc.Height = m_TargetHeight;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+            for (int i = 0; i < HWEncoder::NUM_SURFACES; ++i)
             {
-                Log("[Broadcast] RegisterSurface failed");
+                if (FAILED(m_Device->CreateTexture2D(&desc, nullptr, &m_EncodeSurfaces[i])))
+                {
+                    Log("[Broadcast] CreateTexture2D failed");
+                    return false;
+                }
+
+                if (!m_Encoder.RegisterSurface(i, m_EncodeSurfaces[i]))
+                {
+                    Log("[Broadcast] RegisterSurface failed");
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            if (!m_CpuEncoder.Init(
+                m_TargetWidth,
+                m_TargetHeight,
+                m_Bitrate,
+                static_cast<uint32_t>(std::max(1, m_Fps))))
+            {
+                Log("[Broadcast] CPU encoder init failed");
+                return false;
+            }
+
+            if (!CompileScalerShaders())
+            {
+                Log("[Broadcast] CPU scaler shaders failed");
+                return false;
+            }
+
+            if (!CreateCpuTargets())
+            {
+                Log("[Broadcast] CPU targets failed");
                 return false;
             }
         }
@@ -1656,8 +1995,328 @@ private:
         m_Context->OMSetRenderTargets(1, &nullRTV, nullptr);
     }
 
+    bool CreateCpuTargets()
+    {
+        if (m_CpuRTV)
+        {
+            m_CpuRTV->Release();
+            m_CpuRTV = nullptr;
+        }
+
+        if (m_CpuScaledTex)
+        {
+            m_CpuScaledTex->Release();
+            m_CpuScaledTex = nullptr;
+        }
+
+        if (m_CpuStagingTex)
+        {
+            m_CpuStagingTex->Release();
+            m_CpuStagingTex = nullptr;
+        }
+
+        D3D11_TEXTURE2D_DESC desc = {};
+
+        desc.Width = m_TargetWidth;
+        desc.Height = m_TargetHeight;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = m_Device->CreateTexture2D(&desc, nullptr, &m_CpuScaledTex);
+        if (FAILED(hr))
+        {
+            Log("[Broadcast] CPU scaled texture create failed");
+            return false;
+        }
+
+        hr = m_Device->CreateRenderTargetView(m_CpuScaledTex, nullptr, &m_CpuRTV);
+        if (FAILED(hr))
+        {
+            Log("[Broadcast] CPU RTV create failed");
+            return false;
+        }
+
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+
+        hr = m_Device->CreateTexture2D(&desc, nullptr, &m_CpuStagingTex);
+        if (FAILED(hr))
+        {
+            Log("[Broadcast] CPU staging texture create failed");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool EnsureCpuIntermediate(uint32_t desktopWidth, uint32_t desktopHeight, DXGI_FORMAT format)
+    {
+        if (m_CpuIntermediateReady &&
+            m_DesktopWidth == desktopWidth &&
+            m_DesktopHeight == desktopHeight &&
+            m_DesktopFormat == format)
+        {
+            return true;
+        }
+
+        if (!CompileScalerShaders())
+            return false;
+
+        if (m_IntermediateSRV)
+        {
+            m_IntermediateSRV->Release();
+            m_IntermediateSRV = nullptr;
+        }
+
+        if (m_IntermediateTex)
+        {
+            m_IntermediateTex->Release();
+            m_IntermediateTex = nullptr;
+        }
+
+        D3D11_TEXTURE2D_DESC desc = {};
+
+        desc.Width = desktopWidth;
+        desc.Height = desktopHeight;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = m_Device->CreateTexture2D(&desc, nullptr, &m_IntermediateTex);
+        if (FAILED(hr))
+        {
+            Log("[Broadcast] CPU intermediate texture create failed");
+            return false;
+        }
+
+        hr = m_Device->CreateShaderResourceView(m_IntermediateTex, nullptr, &m_IntermediateSRV);
+        if (FAILED(hr))
+        {
+            Log("[Broadcast] CPU intermediate SRV create failed");
+            return false;
+        }
+
+        m_DesktopWidth = desktopWidth;
+        m_DesktopHeight = desktopHeight;
+        m_DesktopFormat = format;
+        m_CpuIntermediateReady = true;
+
+        return true;
+    }
+
+    void ScaleDesktopToCpuSurface(ID3D11Texture2D* desktopTex)
+    {
+        m_Context->CopyResource(m_IntermediateTex, desktopTex);
+
+        ID3D11RenderTargetView* rtv = m_CpuRTV;
+        m_Context->OMSetRenderTargets(1, &rtv, nullptr);
+
+        D3D11_VIEWPORT vp = {};
+
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width = static_cast<float>(m_TargetWidth);
+        vp.Height = static_cast<float>(m_TargetHeight);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+
+        m_Context->RSSetViewports(1, &vp);
+        m_Context->RSSetState(m_ScaleRaster);
+
+        m_Context->VSSetShader(m_ScaleVS, nullptr, 0);
+        m_Context->PSSetShader(m_ScalePS, nullptr, 0);
+        m_Context->PSSetShaderResources(0, 1, &m_IntermediateSRV);
+        m_Context->PSSetSamplers(0, 1, &m_ScaleSampler);
+
+        m_Context->IASetInputLayout(nullptr);
+        m_Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        m_Context->Draw(3, 0);
+
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        m_Context->PSSetShaderResources(0, 1, &nullSRV);
+
+        ID3D11RenderTargetView* nullRTV = nullptr;
+        m_Context->OMSetRenderTargets(1, &nullRTV, nullptr);
+    }
+
+    bool CaptureCpuFrame(ID3D11Texture2D* desktopTex, bool forceIDR)
+    {
+        if (!desktopTex || !m_CpuStagingTex)
+            return false;
+
+        D3D11_TEXTURE2D_DESC desktopDesc = {};
+        desktopTex->GetDesc(&desktopDesc);
+
+        bool directCopyPossible =
+            desktopDesc.Width == m_TargetWidth &&
+            desktopDesc.Height == m_TargetHeight &&
+            desktopDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        if (directCopyPossible)
+        {
+            m_Context->CopyResource(m_CpuStagingTex, desktopTex);
+        }
+        else
+        {
+            if (!EnsureCpuIntermediate(
+                desktopDesc.Width,
+                desktopDesc.Height,
+                desktopDesc.Format))
+            {
+                return false;
+            }
+
+            ScaleDesktopToCpuSurface(desktopTex);
+            m_Context->CopyResource(m_CpuStagingTex, m_CpuScaledTex);
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+
+        HRESULT hr = m_Context->Map(
+            m_CpuStagingTex,
+            0,
+            D3D11_MAP_READ,
+            0,
+            &mapped
+        );
+
+        if (FAILED(hr))
+        {
+            Log("[Broadcast] CPU map staging failed: " + std::to_string(hr));
+            return false;
+        }
+
+        auto frame = std::make_shared<CpuCapturedFrame>();
+
+        frame->width = m_TargetWidth;
+        frame->height = m_TargetHeight;
+        frame->pitch = static_cast<int>(mapped.RowPitch);
+        frame->forceIdr = forceIDR;
+
+        size_t bytes = static_cast<size_t>(mapped.RowPitch) * m_TargetHeight;
+        frame->pixels.resize(bytes);
+
+        memcpy(frame->pixels.data(), mapped.pData, bytes);
+
+        m_Context->Unmap(m_CpuStagingTex, 0);
+
+        {
+            std::lock_guard<std::mutex> lock(m_CpuMutex);
+
+            // Если нужен IDR, лучше выкинуть старые кадры,
+            // чтобы ключевой кадр не был удален из-за маленькой очереди.
+            if (forceIDR)
+            {
+                while (!m_CpuQueue.empty())
+                    m_CpuQueue.pop();
+            }
+
+            // Очередь должна быть минимальной, чтобы не росла задержка.
+            while (m_CpuQueue.size() >= 2)
+                m_CpuQueue.pop();
+
+            m_CpuQueue.push(std::move(frame));
+        }
+
+        m_CpuCV.notify_one();
+
+        return true;
+    }
+
+    void CpuEncodeLoop()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+        uint32_t encodedCount = 0;
+        auto lastStats = std::chrono::steady_clock::now();
+
+        while (running.load())
+        {
+            std::shared_ptr<CpuCapturedFrame> frame;
+
+            {
+                std::unique_lock<std::mutex> lock(m_CpuMutex);
+
+                m_CpuCV.wait_for(
+                    lock,
+                    std::chrono::milliseconds(2),
+                    [&]
+                    {
+                        return !m_CpuQueue.empty() || !running.load();
+                    }
+                );
+
+                if (!m_CpuQueue.empty())
+                {
+                    frame = std::move(m_CpuQueue.front());
+                    m_CpuQueue.pop();
+                }
+            }
+
+            if (frame)
+            {
+                EncodedPacket pkt;
+                bool isKey = false;
+
+                if (m_CpuEncoder.EncodeBGRA(
+                    frame->pixels.data(),
+                    frame->pitch,
+                    frame->width,
+                    frame->height,
+                    frame->forceIdr,
+                    pkt.data,
+                    isKey))
+                {
+                    pkt.isKey = isKey;
+                    m_SendQueue.Push(std::move(pkt));
+                    ++encodedCount;
+                }
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastStats >= std::chrono::seconds(1))
+            {
+                encodedFps = static_cast<int>(encodedCount);
+                encodedCount = 0;
+                lastStats = now;
+            }
+        }
+
+        encodedFps = 0;
+    }
+
     void CleanupDX()
     {
+        if (m_CpuRTV)
+        {
+            m_CpuRTV->Release();
+            m_CpuRTV = nullptr;
+        }
+
+        if (m_CpuScaledTex)
+        {
+            m_CpuScaledTex->Release();
+            m_CpuScaledTex = nullptr;
+        }
+
+        if (m_CpuStagingTex)
+        {
+            m_CpuStagingTex->Release();
+            m_CpuStagingTex = nullptr;
+        }
+
+        m_CpuIntermediateReady = false;
+
         for (auto* rtv : m_RTViews)
         {
             if (rtv)
@@ -1883,6 +2542,38 @@ private:
                 continue;
             }
 
+            if (m_EncoderKind == EncoderKind::CPU)
+            {
+                bool forceIDR = false;
+
+                if (firstFrame)
+                {
+                    forceIDR = true;
+                    firstFrame = false;
+                }
+                else if (now - lastIdrTime >= std::chrono::seconds(2))
+                {
+                    forceIDR = true;
+                }
+
+                if (forceIDR)
+                    lastIdrTime = now;
+
+                CaptureCpuFrame(desktopTex, forceIDR);
+
+                desktopTex->Release();
+                m_Duplication->ReleaseFrame();
+
+                if (now - lastStatsTime >= std::chrono::seconds(1))
+                {
+                    capturedFps = capturedCount;
+                    capturedCount = 0;
+                    lastStatsTime = now;
+                }
+
+                continue;
+            }
+
             int surfIdx = m_Encoder.GetEncodeIndex();
 
             if (m_Encoder.IsSurfaceEncoding(surfIdx))
@@ -1999,6 +2690,30 @@ private:
 
     std::vector<uint8_t> m_EncodeBuffer;
 
+    EncoderKind m_EncoderKind = EncoderKind::NVENC;
+
+    SoftwareH264Encoder m_CpuEncoder;
+
+    std::thread m_CpuEncodeThread;
+
+    struct CpuCapturedFrame
+    {
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        int pitch = 0;
+        bool forceIdr = false;
+    };
+
+    std::queue<std::shared_ptr<CpuCapturedFrame>> m_CpuQueue;
+    std::mutex m_CpuMutex;
+    std::condition_variable m_CpuCV;
+
+    ID3D11Texture2D* m_CpuScaledTex = nullptr;
+    ID3D11Texture2D* m_CpuStagingTex = nullptr;
+    ID3D11RenderTargetView* m_CpuRTV = nullptr;
+
+    bool m_CpuIntermediateReady = false;
 
     ID3D11Texture2D* m_IntermediateTex = nullptr;
     ID3D11ShaderResourceView* m_IntermediateSRV = nullptr;
@@ -2020,6 +2735,605 @@ private:
 };
 
 
+
+class AudioChat
+{
+public:
+    std::atomic<bool> vadEnabled{ true };
+
+    std::atomic<int> rxAudioPackets{ 0 };
+    std::atomic<int> txAudioPackets{ 0 };
+
+    std::vector<std::string> chatLines;
+    std::mutex chatMutex;
+
+    ~AudioChat()
+    {
+        Stop();
+    }
+
+    bool Connect(const std::string& ip, const std::string& username)
+    {
+        Stop();
+
+        m_Username = username;
+
+        if (!ConnectTCP(ip, CHAT_PORT, m_Sock))
+            return false;
+
+        DWORD sndTimeo = 500;
+        setsockopt(m_Sock, SOL_SOCKET, SO_SNDTIMEO,
+            reinterpret_cast<char*>(&sndTimeo), sizeof(sndTimeo));
+
+        std::vector<uint8_t> login;
+        login.push_back(CHAT_MSG_LOGIN);
+        login.insert(login.end(), username.begin(), username.end());
+
+        if (!SendChatFrame(m_Sock, login))
+        {
+            closesocket(m_Sock);
+            m_Sock = INVALID_SOCKET;
+            return false;
+        }
+
+        return true;
+    }
+
+    void Start()
+    {
+        if (m_Running.load())
+            return;
+
+        if (m_Sock == INVALID_SOCKET)
+            return;
+
+        InitAudio();
+
+        m_Running.store(true);
+        m_Connected.store(true);
+
+        m_RecvThread = std::thread(&AudioChat::RecvLoop, this);
+        m_SendThread = std::thread(&AudioChat::SendLoop, this);
+
+        Log("[Audio] Voice started");
+    }
+
+    void Stop()
+    {
+        if (!m_Running.exchange(false) &&
+            m_Sock == INVALID_SOCKET &&
+            !m_RecvThread.joinable() &&
+            !m_SendThread.joinable())
+        {
+            CleanupAudio();
+            return;
+        }
+
+        m_Connected.store(false);
+        m_SendCV.notify_all();
+
+        if (m_Sock != INVALID_SOCKET)
+        {
+            shutdown(m_Sock, SD_BOTH);
+            closesocket(m_Sock);
+            m_Sock = INVALID_SOCKET;
+        }
+
+        if (m_RecvThread.joinable())
+            m_RecvThread.join();
+
+        if (m_SendThread.joinable())
+            m_SendThread.join();
+
+        CleanupAudio();
+
+        {
+            std::lock_guard<std::mutex> lock(m_QueueMutex);
+
+            while (!m_NetOutQueue.empty())
+                m_NetOutQueue.pop();
+
+            while (!m_CapRawQueue.empty())
+                m_CapRawQueue.pop();
+        }
+
+        m_CapPcm.clear();
+
+        rxAudioPackets = 0;
+        txAudioPackets = 0;
+
+        Log("[Audio] Voice stopped");
+    }
+
+    bool IsConnected() const
+    {
+        return m_Connected.load();
+    }
+
+    void SetMicEnabled(bool enabled)
+    {
+        m_MicEnabled.store(enabled);
+    }
+
+    void SetVadEnabled(bool enabled)
+    {
+        vadEnabled.store(enabled);
+    }
+
+    void SendChatText(const std::string& text)
+    {
+        if (text.empty())
+            return;
+
+        if (!m_Running.load())
+            return;
+
+        std::vector<uint8_t> pkt;
+        pkt.reserve(1 + text.size());
+        pkt.push_back(CHAT_MSG_TEXT);
+        pkt.insert(pkt.end(), text.begin(), text.end());
+
+        PushNetworkPacket(std::move(pkt));
+    }
+
+private:
+    static void PlaybackCallback(void* userdata, Uint8* stream, int len)
+    {
+        AudioChat* self = static_cast<AudioChat*>(userdata);
+
+        if (!self || !self->m_PlayStream)
+        {
+            memset(stream, 0, len);
+            return;
+        }
+
+        int got = SDL_AudioStreamGet(self->m_PlayStream, stream, len);
+
+        if (got < 0)
+            got = 0;
+
+        if (got < len)
+            memset(stream + got, 0, len - got);
+    }
+
+    static void CaptureCallback(void* userdata, Uint8* stream, int len)
+    {
+        AudioChat* self = static_cast<AudioChat*>(userdata);
+
+        if (!self)
+            return;
+
+        if (!self->m_Running.load())
+            return;
+
+        if (!self->m_MicEnabled.load())
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(self->m_QueueMutex);
+
+            while (self->m_CapRawQueue.size() >= 8)
+                self->m_CapRawQueue.pop();
+
+            self->m_CapRawQueue.emplace(stream, stream + len);
+        }
+
+        self->m_SendCV.notify_one();
+    }
+
+    void PushNetworkPacket(std::vector<uint8_t>&& pkt)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_QueueMutex);
+
+            while (m_NetOutQueue.size() >= 64)
+                m_NetOutQueue.pop();
+
+            m_NetOutQueue.push(std::move(pkt));
+        }
+
+        m_SendCV.notify_one();
+    }
+
+    bool InitAudio()
+    {
+        if ((SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) == 0)
+        {
+            if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
+            {
+                Log(std::string("[Audio] SDL_InitSubSystem failed: ") + SDL_GetError());
+                return false;
+            }
+        }
+
+        SDL_AudioSpec want{};
+        want.freq = 48000;
+        want.format = AUDIO_S16SYS;
+        want.channels = 1;
+        want.samples = 960; // 20 ms
+        want.callback = PlaybackCallback;
+        want.userdata = this;
+
+        m_PlayDev = SDL_OpenAudioDevice(
+            nullptr,
+            0,
+            &want,
+            &m_PlaySpec,
+            SDL_AUDIO_ALLOW_ANY_CHANGE
+        );
+
+        if (m_PlayDev == 0)
+        {
+            Log(std::string("[Audio] Playback open failed: ") + SDL_GetError());
+        }
+        else
+        {
+            m_PlayStream = SDL_NewAudioStream(
+                AUDIO_S16SYS,
+                1,
+                48000,
+                m_PlaySpec.format,
+                m_PlaySpec.channels,
+                m_PlaySpec.freq
+            );
+
+            if (!m_PlayStream)
+            {
+                SDL_CloseAudioDevice(m_PlayDev);
+                m_PlayDev = 0;
+                Log("[Audio] PlayStream create failed");
+            }
+            else
+            {
+                SDL_PauseAudioDevice(m_PlayDev, 0);
+            }
+        }
+
+        want.callback = CaptureCallback;
+        want.userdata = this;
+
+        m_CapDev = SDL_OpenAudioDevice(
+            nullptr,
+            1,
+            &want,
+            &m_CapSpec,
+            SDL_AUDIO_ALLOW_ANY_CHANGE
+        );
+
+        if (m_CapDev == 0)
+        {
+            Log(std::string("[Audio] Capture open failed: ") + SDL_GetError());
+        }
+        else
+        {
+            m_CapStream = SDL_NewAudioStream(
+                m_CapSpec.format,
+                m_CapSpec.channels,
+                m_CapSpec.freq,
+                AUDIO_S16SYS,
+                1,
+                48000
+            );
+
+            if (!m_CapStream)
+            {
+                SDL_CloseAudioDevice(m_CapDev);
+                m_CapDev = 0;
+                Log("[Audio] CaptureStream create failed");
+            }
+            else
+            {
+                SDL_PauseAudioDevice(m_CapDev, 0);
+
+                Log("[Audio] Capture opened: freq=" +
+                    std::to_string(m_CapSpec.freq) +
+                    ", channels=" +
+                    std::to_string(m_CapSpec.channels));
+            }
+        }
+
+        return m_PlayDev != 0;
+    }
+
+    void CleanupAudio()
+    {
+        if (m_CapDev)
+        {
+            SDL_CloseAudioDevice(m_CapDev);
+            m_CapDev = 0;
+        }
+
+        if (m_PlayDev)
+        {
+            SDL_CloseAudioDevice(m_PlayDev);
+            m_PlayDev = 0;
+        }
+
+        if (m_CapStream)
+        {
+            SDL_FreeAudioStream(m_CapStream);
+            m_CapStream = nullptr;
+        }
+
+        if (m_PlayStream)
+        {
+            SDL_FreeAudioStream(m_PlayStream);
+            m_PlayStream = nullptr;
+        }
+    }
+
+    void RecvLoop()
+    {
+        while (m_Running.load())
+        {
+            std::vector<uint8_t> frame;
+
+            if (!RecvChatFrame(m_Sock, frame))
+                break;
+
+            HandleReceivedFrame(frame);
+        }
+
+        m_Connected.store(false);
+        m_Running.store(false);
+        m_SendCV.notify_all();
+    }
+
+    void HandleReceivedFrame(const std::vector<uint8_t>& frame)
+    {
+        if (frame.empty())
+            return;
+
+        uint8_t type = frame[0];
+
+        if (type == CHAT_MSG_TEXT)
+        {
+            std::string text(frame.begin() + 1, frame.end());
+
+            {
+                std::lock_guard<std::mutex> lock(chatMutex);
+
+                chatLines.push_back(text);
+
+                if (chatLines.size() > 300)
+                    chatLines.erase(chatLines.begin());
+            }
+
+            Log("[Chat] " + text);
+        }
+        else if (type == CHAT_MSG_AUDIO_PCM)
+        {
+            // [type][seq][pcm]
+            if (frame.size() <= 5)
+                return;
+
+            PlayPcm(frame.data() + 5, static_cast<int>(frame.size() - 5));
+
+            ++rxAudioPackets;
+        }
+    }
+
+    void PlayPcm(const uint8_t* data, int size)
+    {
+        if (!m_PlayStream)
+            return;
+
+        if (size <= 0)
+            return;
+
+        // Ограничиваем буфер воспроизведения примерно 250 ms.
+        // 48000 * 2 bytes * 0.25 = 19200 bytes.
+        if (SDL_AudioStreamAvailable(m_PlayStream) > 19200)
+        {
+            SDL_AudioStreamClear(m_PlayStream);
+        }
+
+        SDL_AudioStreamPut(m_PlayStream, data, size);
+    }
+
+    void SendLoop()
+    {
+        // 20 ms @ 48 kHz mono s16
+        const size_t AUDIO_FRAME_BYTES = 960 * sizeof(int16_t);
+
+        while (m_Running.load())
+        {
+            std::vector<uint8_t> netPkt;
+            std::vector<uint8_t> raw;
+
+            bool haveNet = false;
+            bool haveRaw = false;
+
+            {
+                std::unique_lock<std::mutex> lock(m_QueueMutex);
+
+                m_SendCV.wait_for(
+                    lock,
+                    std::chrono::milliseconds(10),
+                    [&]
+                    {
+                        return !m_Running.load() ||
+                               !m_NetOutQueue.empty() ||
+                               !m_CapRawQueue.empty();
+                    }
+                );
+
+                if (!m_NetOutQueue.empty())
+                {
+                    netPkt = std::move(m_NetOutQueue.front());
+                    m_NetOutQueue.pop();
+                    haveNet = true;
+                }
+                else if (!m_CapRawQueue.empty())
+                {
+                    raw = std::move(m_CapRawQueue.front());
+                    m_CapRawQueue.pop();
+                    haveRaw = true;
+                }
+            }
+
+            if (!m_Running.load())
+                break;
+
+            if (haveNet)
+            {
+                if (!SendChatFrame(m_Sock, netPkt))
+                {
+                    m_Connected.store(false);
+                    m_Running.store(false);
+                    break;
+                }
+
+                continue;
+            }
+
+            if (haveRaw && m_CapStream)
+            {
+                if (!m_MicEnabled.load())
+                {
+                    m_CapPcm.clear();
+                    continue;
+                }
+
+                SDL_AudioStreamPut(
+                    m_CapStream,
+                    raw.data(),
+                    static_cast<int>(raw.size())
+                );
+
+                int avail = SDL_AudioStreamAvailable(m_CapStream);
+
+                if (avail > 0)
+                {
+                    std::vector<uint8_t> tmp(avail);
+
+                    int got = SDL_AudioStreamGet(
+                        m_CapStream,
+                        tmp.data(),
+                        avail
+                    );
+
+                    if (got > 0)
+                    {
+                        m_CapPcm.insert(
+                            m_CapPcm.end(),
+                            tmp.begin(),
+                            tmp.begin() + got
+                        );
+                    }
+                }
+
+                while (m_CapPcm.size() >= AUDIO_FRAME_BYTES)
+                {
+                    bool sendFrame = true;
+
+                    if (vadEnabled.load())
+                    {
+                        const int16_t* samples =
+                            reinterpret_cast<const int16_t*>(m_CapPcm.data());
+
+                        size_t count = AUDIO_FRAME_BYTES / sizeof(int16_t);
+
+                        int64_t sum = 0;
+
+                        for (size_t i = 0; i < count; ++i)
+                        {
+                            int v = samples[i];
+
+                            if (v < 0)
+                                v = -v;
+
+                            sum += v;
+                        }
+
+                        int avg = static_cast<int>(sum / static_cast<int64_t>(count));
+
+                        // Порог можно менять.
+                        // Если микрофон тихий, уменьшите до 20-40.
+                        if (avg > 70)
+                        {
+                            m_VadHangover = 25;
+                        }
+                        else if (m_VadHangover > 0)
+                        {
+                            --m_VadHangover;
+                        }
+
+                        sendFrame = (m_VadHangover > 0);
+                    }
+
+                    if (sendFrame)
+                    {
+                        std::vector<uint8_t> pkt;
+                        pkt.reserve(1 + 4 + AUDIO_FRAME_BYTES);
+
+                        pkt.push_back(CHAT_MSG_AUDIO_PCM);
+                        AppendU32LE(pkt, m_Seq++);
+
+                        pkt.insert(
+                            pkt.end(),
+                            m_CapPcm.begin(),
+                            m_CapPcm.begin() + AUDIO_FRAME_BYTES
+                        );
+
+                        if (!SendChatFrame(m_Sock, pkt))
+                        {
+                            m_Connected.store(false);
+                            m_Running.store(false);
+                            break;
+                        }
+
+                        ++txAudioPackets;
+                    }
+
+                    m_CapPcm.erase(
+                        m_CapPcm.begin(),
+                        m_CapPcm.begin() + AUDIO_FRAME_BYTES
+                    );
+                }
+
+                // Защита от неожиданного роста буфера
+                if (m_CapPcm.size() > 96000)
+                    m_CapPcm.clear();
+
+                if (!m_Running.load())
+                    break;
+            }
+        }
+    }
+
+private:
+    SOCKET m_Sock = INVALID_SOCKET;
+
+    std::string m_Username;
+
+    std::atomic<bool> m_Running{ false };
+    std::atomic<bool> m_Connected{ false };
+    std::atomic<bool> m_MicEnabled{ true };
+
+    std::thread m_RecvThread;
+    std::thread m_SendThread;
+
+    std::queue<std::vector<uint8_t>> m_NetOutQueue;
+    std::queue<std::vector<uint8_t>> m_CapRawQueue;
+
+    std::mutex m_QueueMutex;
+    std::condition_variable m_SendCV;
+
+    SDL_AudioDeviceID m_PlayDev = 0;
+    SDL_AudioDeviceID m_CapDev = 0;
+
+    SDL_AudioSpec m_PlaySpec{};
+    SDL_AudioSpec m_CapSpec{};
+
+    SDL_AudioStream* m_PlayStream = nullptr;
+    SDL_AudioStream* m_CapStream = nullptr;
+
+    std::vector<uint8_t> m_CapPcm;
+
+    uint32_t m_Seq = 0;
+    int m_VadHangover = 0;
+};
 
 static void ApplyDarkTheme()
 {
@@ -2088,7 +3402,7 @@ int main(int argc, char* argv[])
 
     SDL_SetMainReady();
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0)
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0)
     {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
         WSACleanup();
@@ -2153,6 +3467,7 @@ int main(int argc, char* argv[])
 
     VideoReceiver videoReceiver;
     ScreenBroadcaster broadcaster;
+    AudioChat audioChat;
 
     Role role = Role::Idle;
 
@@ -2160,9 +3475,16 @@ int main(int argc, char* argv[])
     strncpy(ipBuffer, ip.c_str(), sizeof(ipBuffer) - 1);
     ipBuffer[sizeof(ipBuffer) - 1] = '\0';
 
+    char usernameBuffer[64] = "User";
+    char chatInputBuffer[512] = "";
+
+    bool micEnabled = true;
+    bool voiceActivationEnabled = true;
+
     int resolutionIndex = 1;
     int bitrateKbps = 8000;
     int fps = 60;
+    int encoderIndex = 0; // 0 = NVENC, 1 = CPU x264
 
     SDL_Texture* videoTexture = nullptr;
     int videoWidth = 0;
@@ -2216,6 +3538,7 @@ int main(int argc, char* argv[])
 
             cfg.fps = fps;
             cfg.bitrateKbps = bitrateKbps;
+            cfg.encoder = (encoderIndex == 0) ? EncoderKind::NVENC : EncoderKind::CPU;
 
             if (broadcaster.Connect(ipBuffer))
             {
@@ -2350,6 +3673,7 @@ int main(int argc, char* argv[])
         ImGui::Spacing();
 
         ImGui::Combo("Resolution", &resolutionIndex, "1280x720\01920x1080\02560x1440\0");
+        ImGui::Combo("Encoder", &encoderIndex, "NVENC\0CPU x264\0");
         ImGui::SliderInt("FPS", &fps, 15, 60);
         ImGui::SliderInt("Bitrate kbps", &bitrateKbps, 1000, 20000);
 
@@ -2416,6 +3740,85 @@ int main(int argc, char* argv[])
             ImGui::Text("Sent FPS: %d", broadcaster.sentFps.load());
             ImGui::Text("Sent bitrate: %d kbps", broadcaster.sentKbps.load());
         }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Text("Voice / Chat");
+
+        ImGui::InputText("Username", usernameBuffer, sizeof(usernameBuffer));
+
+        ImGui::Checkbox("Microphone", &micEnabled);
+        ImGui::Checkbox("Voice activation", &voiceActivationEnabled);
+
+        audioChat.SetMicEnabled(micEnabled);
+        audioChat.SetVadEnabled(voiceActivationEnabled);
+
+        if (audioChat.IsConnected())
+        {
+            if (ImGui::Button("Stop voice", ImVec2(-1, 36)))
+            {
+                audioChat.Stop();
+            }
+
+            ImGui::Text("Voice RX packets: %d", audioChat.rxAudioPackets.load());
+            ImGui::Text("Voice TX packets: %d", audioChat.txAudioPackets.load());
+        }
+        else
+        {
+            if (ImGui::Button("Start voice", ImVec2(-1, 36)))
+            {
+                if (audioChat.Connect(ipBuffer, usernameBuffer))
+                {
+                    audioChat.SetMicEnabled(micEnabled);
+                    audioChat.SetVadEnabled(voiceActivationEnabled);
+                    audioChat.Start();
+                }
+                else
+                {
+                    Log("[Main] Failed to connect to voice chat");
+                }
+            }
+        }
+
+        ImGui::Spacing();
+
+        if (ImGui::InputText(
+            "Message",
+            chatInputBuffer,
+            sizeof(chatInputBuffer),
+            ImGuiInputTextFlags_EnterReturnsTrue))
+        {
+            if (chatInputBuffer[0] != '\0')
+            {
+                audioChat.SendChatText(chatInputBuffer);
+                chatInputBuffer[0] = '\0';
+            }
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Send"))
+        {
+            if (chatInputBuffer[0] != '\0')
+            {
+                audioChat.SendChatText(chatInputBuffer);
+                chatInputBuffer[0] = '\0';
+            }
+        }
+
+        ImGui::BeginChild("VoiceChatLog", ImVec2(0, 100), true);
+        {
+            std::lock_guard<std::mutex> lock(audioChat.chatMutex);
+
+            for (const auto& line : audioChat.chatLines)
+                ImGui::TextWrapped("%s", line.c_str());
+
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10.0f)
+                ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -2494,6 +3897,7 @@ int main(int argc, char* argv[])
 
 shutdown:
 
+    audioChat.Stop();
     videoReceiver.Stop();
     broadcaster.Stop();
 

@@ -52,6 +52,14 @@
 static const size_t RING_BUFFER_SIZE = 30;
 static const uint32_t MAX_FRAME_SIZE = 4 * 1024 * 1024;
 
+// ---- Chat/voice protocol ----
+static const uint8_t CHAT_MSG_LOGIN      = 0x00;
+static const uint8_t CHAT_MSG_TEXT       = 0x01;
+static const uint8_t CHAT_MSG_AUDIO_PCM  = 0x02;
+static const uint8_t CHAT_MSG_AUDIO_OPUS = 0x03;
+
+static const uint32_t MAX_CHAT_FRAME_SIZE = 1 * 1024 * 1024;
+
 std::atomic<bool> g_Running{ true };
 
 
@@ -100,6 +108,59 @@ static bool RecvAll(SOCKET sock, void* buf, int len)
 
         received += n;
     }
+
+    return true;
+}
+
+static bool SendAll(SOCKET sock, const void* buf, int len)
+{
+    const char* ptr = static_cast<const char*>(buf);
+    int sent = 0;
+
+    while (sent < len)
+    {
+        int n = send(sock, ptr + sent, len - sent, 0);
+        if (n <= 0)
+            return false;
+
+        sent += n;
+    }
+
+    return true;
+}
+
+static bool SendChatFrame(SOCKET sock, const uint8_t* data, size_t size)
+{
+    uint32_t len = static_cast<uint32_t>(size);
+
+    if (!SendAll(sock, &len, 4))
+        return false;
+
+    if (!SendAll(sock, data, static_cast<int>(size)))
+        return false;
+
+    return true;
+}
+
+static bool SendChatFrame(SOCKET sock, const std::vector<uint8_t>& data)
+{
+    return SendChatFrame(sock, data.data(), data.size());
+}
+
+static bool RecvChatFrame(SOCKET sock, std::vector<uint8_t>& out)
+{
+    uint32_t len = 0;
+
+    if (!RecvAll(sock, &len, 4))
+        return false;
+
+    if (len == 0 || len > MAX_CHAT_FRAME_SIZE)
+        return false;
+
+    out.resize(len);
+
+    if (!RecvAll(sock, out.data(), static_cast<int>(len)))
+        return false;
 
     return true;
 }
@@ -572,79 +633,88 @@ void BroadcasterAcceptThread()
 
 
 
-struct ChatClientInfo
+struct ChatClient
 {
-    SOCKET socket;
+    SOCKET socket = INVALID_SOCKET;
     std::string username;
+
+    std::mutex sendMutex;
+    std::atomic<bool> alive{ true };
+
+    std::chrono::steady_clock::time_point audioWindowStart{};
+    uint32_t audioWindowCount = 0;
 };
 
-std::vector<ChatClientInfo> g_ChatClients;
-std::mutex g_ChatClientsMutex;
+static std::vector<std::shared_ptr<ChatClient>> g_ChatClients;
+static std::mutex g_ChatClientsMutex;
 
-static void ForwardRawToOthers(const char* data, int len, SOCKET senderSocket)
+static std::vector<uint8_t> MakeTextFrame(const std::string& text)
 {
-    std::vector<SOCKET> targets;
+    std::vector<uint8_t> frame;
+    frame.reserve(1 + text.size());
+    frame.push_back(CHAT_MSG_TEXT);
+    frame.insert(frame.end(), text.begin(), text.end());
+    return frame;
+}
+
+static void BroadcastChatFrame(const std::vector<uint8_t>& payload, SOCKET excludeSocket)
+{
+    std::vector<std::shared_ptr<ChatClient>> targets;
 
     {
         std::lock_guard<std::mutex> lock(g_ChatClientsMutex);
+        targets = g_ChatClients;
+    }
 
-        for (const auto& client : g_ChatClients)
+    for (auto& client : targets)
+    {
+        if (!client)
+            continue;
+
+        if (!client->alive.load())
+            continue;
+
+        if (excludeSocket != INVALID_SOCKET && client->socket == excludeSocket)
+            continue;
+
+        std::lock_guard<std::mutex> lock(client->sendMutex);
+
+        if (!SendChatFrame(client->socket, payload))
         {
-            if (client.socket != senderSocket)
-                targets.push_back(client.socket);
+            client->alive.store(false);
         }
     }
-
-    for (SOCKET sock : targets)
-    {
-        send(sock, data, len, 0);
-    }
-}
-
-static void BroadcastChatMessage(const std::string& message, SOCKET senderSocket)
-{
-    ForwardRawToOthers(message.data(), static_cast<int>(message.size()), senderSocket);
 }
 
 void HandleChatClient(SOCKET clientSocket)
 {
     int flag = 1;
-    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&flag), sizeof(flag));
+    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY,
+        reinterpret_cast<char*>(&flag), sizeof(flag));
 
-    DWORD sendTimeout = 2000;
-    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&sendTimeout), sizeof(sendTimeout));
+    DWORD sendTimeout = 500;
+    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO,
+        reinterpret_cast<char*>(&sendTimeout), sizeof(sendTimeout));
 
-    char buffer[16384];
+    auto client = std::make_shared<ChatClient>();
+    client->socket = clientSocket;
 
+    std::vector<uint8_t> frame;
 
-    int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-
-    if (bytesReceived <= 0)
+    // Первый пакет обязательно должен быть логином
+    if (!RecvChatFrame(clientSocket, frame))
     {
         closesocket(clientSocket);
         return;
     }
 
-    buffer[bytesReceived] = '\0';
-
-    bool firstIsControl =
-        bytesReceived > 0 &&
-        (
-            static_cast<unsigned char>(buffer[0]) == 0x01 ||
-            static_cast<unsigned char>(buffer[0]) == 0x02 ||
-            static_cast<unsigned char>(buffer[0]) == 0x03
-            );
-
-    std::string username;
-
-    if (firstIsControl)
+    if (frame.empty() || frame[0] != CHAT_MSG_LOGIN)
     {
-        username = "User";
+        closesocket(clientSocket);
+        return;
     }
-    else
-    {
-        username = std::string(buffer, bytesReceived);
-    }
+
+    std::string username(frame.begin() + 1, frame.end());
 
     while (!username.empty() &&
         (username.back() == '\n' || username.back() == '\r' || username.back() == ' '))
@@ -655,74 +725,93 @@ void HandleChatClient(SOCKET clientSocket)
     if (username.empty())
         username = "User";
 
+    client->username = username;
+
     {
         std::lock_guard<std::mutex> lock(g_ChatClientsMutex);
-        g_ChatClients.push_back({ clientSocket, username });
+        g_ChatClients.push_back(client);
     }
 
     std::cout << "[Chat] " << username << " connected." << std::endl;
 
-    BroadcastChatMessage("\x01[Server] " + username + " joined the room.\n", clientSocket);
-
-    auto ProcessPacket = [&](const char* buf, int len)
-        {
-            if (len <= 0)
-                return;
-
-            unsigned char type = static_cast<unsigned char>(buf[0]);
-
-            if (type == 0x01 && len > 1)
-            {
-                std::string text(buf + 1, len - 1);
-
-                std::string outMessage = "\x01[" + username + "]: " + text;
-
-                std::cout << "[" << username << "]: " << text << std::endl;
-
-                BroadcastChatMessage(outMessage, clientSocket);
-            }
-            else if (type == 0x02 || type == 0x03)
-            {
-
-
-                ForwardRawToOthers(buf, len, clientSocket);
-            }
-        };
-
-    if (firstIsControl)
-    {
-        ProcessPacket(buffer, bytesReceived);
-    }
+    BroadcastChatFrame(
+        MakeTextFrame("[Server] " + username + " joined the room."),
+        INVALID_SOCKET
+    );
 
     while (g_Running.load())
     {
-        bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
-
-        if (bytesReceived <= 0)
-        {
-            std::cout << "[Chat] " << username << " disconnected." << std::endl;
+        if (!RecvChatFrame(clientSocket, frame))
             break;
-        }
 
-        ProcessPacket(buffer, bytesReceived);
+        if (frame.empty())
+            continue;
+
+        uint8_t type = frame[0];
+
+        if (type == CHAT_MSG_TEXT)
+        {
+            std::string text(frame.begin() + 1, frame.end());
+
+            std::cout << "[" << username << "]: " << text << std::endl;
+
+            // Отправляем всем, включая автора.
+            // Так клиент может показывать и свои сообщения.
+            BroadcastChatFrame(frame, INVALID_SOCKET);
+        }
+        else if (type == CHAT_MSG_AUDIO_PCM || type == CHAT_MSG_AUDIO_OPUS)
+        {
+            // Простой rate limit.
+            // 20 ms PCM = 50 пакетов/сек.
+            // 100 пакетов/сек — с запасом.
+
+            auto now = std::chrono::steady_clock::now();
+
+            if (now - client->audioWindowStart >= std::chrono::seconds(1))
+            {
+                client->audioWindowStart = now;
+                client->audioWindowCount = 0;
+            }
+
+            ++client->audioWindowCount;
+
+            if (client->audioWindowCount <= 100)
+            {
+                // Аудио отправляем всем, кроме источника
+                BroadcastChatFrame(frame, clientSocket);
+            }
+        }
+        else if (type == CHAT_MSG_LOGIN)
+        {
+            // Повторный логин можно игнорировать.
+            // При желании можно обновить имя.
+        }
     }
 
     {
         std::lock_guard<std::mutex> lock(g_ChatClientsMutex);
 
-        for (auto it = g_ChatClients.begin(); it != g_ChatClients.end(); ++it)
-        {
-            if (it->socket == clientSocket)
-            {
-                g_ChatClients.erase(it);
-                break;
-            }
-        }
+        g_ChatClients.erase(
+            std::remove_if(
+                g_ChatClients.begin(),
+                g_ChatClients.end(),
+                [&](const std::shared_ptr<ChatClient>& item)
+                {
+                    return item.get() == client.get();
+                }
+            ),
+            g_ChatClients.end()
+        );
     }
 
-    BroadcastChatMessage("\x01[Server] " + username + " left the room.\n", clientSocket);
+    BroadcastChatFrame(
+        MakeTextFrame("[Server] " + username + " left the room."),
+        clientSocket
+    );
 
     closesocket(clientSocket);
+
+    std::cout << "[Chat] " << username << " disconnected." << std::endl;
 }
 
 void ChatServerThread()
